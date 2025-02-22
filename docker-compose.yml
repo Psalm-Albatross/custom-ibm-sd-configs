@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  app:
+    image: custom-ibm-sd-configs:latest
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Secure Redis password
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:6.2
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Secure Redis password
+
+volumes:
+  redis-data:
+    driver: local
