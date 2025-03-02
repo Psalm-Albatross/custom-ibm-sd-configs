@@ -638,12 +638,12 @@ func main() {
 		return
 	}
 
-	if len(os.Args) == 1 {
-		fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
-		fmt.Println("Usage:")
-		flag.PrintDefaults()
-		return
-	}
+	// if len(os.Args) == 1 {
+	// 	fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
+	// 	fmt.Println("Usage:")
+	// 	flag.PrintDefaults()
+	// 	return
+	// }
 
 	rdb = redis.NewClient(&redis.Options{
 		Addr: *redisAddr,
