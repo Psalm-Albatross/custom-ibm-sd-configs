@@ -576,6 +576,12 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(targets)
 }
 
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"healthy"}`))
+}
+
 func main() {
 	accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
 	regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
@@ -602,6 +608,7 @@ func main() {
 
 	http.HandleFunc("/help", helpHandler)
 	http.HandleFunc("/prometheus", prometheusHandler)
+	http.HandleFunc("/health", healthCheckHandler) // Add health check endpoint
 
 	fmt.Printf("IBM Cloud Service Discovery running on :%s\n", *port)
 	log.Fatal(http.ListenAndServe(":"+*port, nil))
