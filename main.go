@@ -23,6 +23,8 @@ import (
 // Config structure
 type Config struct {
 	Accounts map[string]string `json:"accounts"`
+	Port     string            `json:"port"`
+	Regions  map[string]string `json:"regions"` // Add Port field
 }
 
 // Instance struct
@@ -40,17 +42,24 @@ type Instance struct {
 }
 
 var (
-	ctx    = context.Background()
-	rdb    *redis.Client
-	expiry = 5 * time.Minute // Cache expiry time
+	ctx     = context.Background()
+	rdb     *redis.Client
+	expiry  = 5 * time.Minute // Cache expiry time
+	version string            // Version variable to be set by ldflags
 )
-
-const version = "1.0.0"
 
 func init() {
 	rdb = redis.NewClient(&redis.Options{
 		Addr: "localhost:6379", // Redis server address
 	})
+
+	// Load configuration from config.json
+	viper.SetConfigName("config")
+	viper.SetConfigType("json")
+	viper.AddConfigPath(".")
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatalf("Error reading config file: %v", err)
+	}
 }
 
 // Load API Key from different sources
@@ -417,7 +426,7 @@ func fetchFloatingIPs(vpcService *vpcv1.VpcV1) (map[string]string, error) {
 func instanceHandler(w http.ResponseWriter, r *http.Request) {
 	accounts := r.URL.Query().Get("accounts")
 	if accounts == "" {
-		accounts = "account1,account2"
+		accounts = "account1"
 	}
 
 	regions := r.URL.Query().Get("regions")
@@ -583,9 +592,11 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
-	regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
-	port := flag.String("port", "8080", "Port to run the server on")
+	// accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
+	// regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
+	accounts := flag.String("accounts", viper.GetString("accounts"), "Comma-separated list of IBM Cloud accounts") // Use accounts from config.json
+	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")     // Use regions from config.json
+	port := flag.String("port", viper.GetString("port"), "Port to run the server on")                              // Use port from config.json
 	showVersion := flag.Bool("version", false, "Show tool version")
 	flag.Parse()
 
@@ -594,12 +605,12 @@ func main() {
 		return
 	}
 
-	if len(os.Args) == 1 {
-		fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
-		fmt.Println("Usage:")
-		flag.PrintDefaults()
-		return
-	}
+	// if len(os.Args) == 1 {
+	// 	fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
+	// 	fmt.Println("Usage:")
+	// 	flag.PrintDefaults()
+	// 	return
+	// }
 
 	http.HandleFunc("/instances", func(w http.ResponseWriter, r *http.Request) {
 		r.URL.RawQuery = fmt.Sprintf("accounts=%s&regions=%s", *accounts, *regions)

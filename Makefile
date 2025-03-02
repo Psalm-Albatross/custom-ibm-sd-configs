@@ -11,6 +11,8 @@ TARGETS = \
 # Output directory for binaries
 OUTPUT_DIR = bin
 
+VERSION := 1.1.0
+
 all: clean build
 
 clean:
@@ -19,6 +21,10 @@ clean:
 build: check-gox
 	mkdir -p $(OUTPUT_DIR)
 	gox -osarch="$(TARGETS)" -output="$(OUTPUT_DIR)/{{.Dir}}_{{.OS}}_{{.Arch}}" ./...
+	go build -ldflags "-X main.version=$(VERSION)" -o custom-ibm-sd-configs main.go
+
+run:
+	go run -ldflags "-X main.version=$(VERSION)" main.go
 
 check-gox:
 	@command -v gox >/dev/null 2>&1 || { echo >&2 "gox is not installed. Please run 'go install github.com/mitchellh/gox@latest'"; exit 1; }

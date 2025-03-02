@@ -1,5 +1,5 @@
 {
-	"accounts": ["account1"],
-	"tags": ["tag1", "tag2"],
-	"regions": ["us-west-2"]
+	"accounts": ["account1", "account2", "account3"],
+	"regions": ["us-west-2"],
+	"port": 9000
 }
