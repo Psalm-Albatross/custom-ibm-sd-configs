@@ -579,6 +579,7 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
 	regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
+	port := flag.String("port", "8080", "Port to run the server on")
 	showVersion := flag.Bool("version", false, "Show tool version")
 	flag.Parse()
 
@@ -602,8 +603,8 @@ func main() {
 	http.HandleFunc("/help", helpHandler)
 	http.HandleFunc("/prometheus", prometheusHandler)
 
-	fmt.Println("IBM Cloud Service Discovery running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	fmt.Printf("IBM Cloud Service Discovery running on :%s\n", *port)
+	log.Fatal(http.ListenAndServe(":"+*port, nil))
 }
 
 func maskAccount(account string) string {
