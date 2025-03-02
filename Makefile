@@ -20,8 +20,7 @@ clean:
 
 build: check-gox
 	mkdir -p $(OUTPUT_DIR)
-	gox -osarch="$(TARGETS)" -output="$(OUTPUT_DIR)/{{.Dir}}_{{.OS}}_{{.Arch}}" ./...
-	go build -ldflags "-X main.version=$(VERSION)" -o custom-ibm-sd-configs main.go
+	gox -osarch="$(TARGETS)" -ldflags "-X main.version=$(VERSION)" -output="$(OUTPUT_DIR)/{{.Dir}}_{{.OS}}_{{.Arch}}" ./...
 
 run:
 	go run -ldflags "-X main.version=$(VERSION)" main.go
