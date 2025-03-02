@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 // Config structure
 type Config struct {
 	Accounts map[string]string `json:"accounts"`
+	Port     string            `json:"port"`
 }
 
 // Instance struct
@@ -576,11 +578,59 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(targets)
 }
 
+// Add health check handler
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// Add logging middleware
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("Request: %s %s, Duration: %s", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+// Add graceful shutdown
+func startServer(server *http.Server) {
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Could not listen on %s: %v\n", server.Addr, err)
+		}
+	}()
+	log.Printf("Server is ready to handle requests at %s", server.Addr)
+
+	// Graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	<-stop
+
+	log.Printf("Shutting down the server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Could not gracefully shutdown the server: %v\n", err)
+	}
+	log.Printf("Server stopped")
+}
+
 func main() {
+	// Load configuration from config.json
+	viper.SetConfigName("config")
+	viper.SetConfigType("json")
+	viper.AddConfigPath(".")
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatalf("Error reading config file: %v", err)
+	}
+
 	accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
 	regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
-	port := flag.String("port", "8080", "Port to run the server on")
+	port := flag.String("port", viper.GetString("port"), "Port to run the server on") // Read port from config.json
 	showVersion := flag.Bool("version", false, "Show tool version")
+	redisAddr := flag.String("redis-addr", "localhost:6379", "Redis server address")
 	flag.Parse()
 
 	if *showVersion {
@@ -595,16 +645,26 @@ func main() {
 		return
 	}
 
+	rdb = redis.NewClient(&redis.Options{
+		Addr: *redisAddr,
+	})
+
 	http.HandleFunc("/instances", func(w http.ResponseWriter, r *http.Request) {
 		r.URL.RawQuery = fmt.Sprintf("accounts=%s&regions=%s", *accounts, *regions)
 		instanceHandler(w, r)
 	})
-
 	http.HandleFunc("/help", helpHandler)
 	http.HandleFunc("/prometheus", prometheusHandler)
+	http.HandleFunc("/health", healthCheckHandler) // Add health check endpoint
 
-	fmt.Printf("IBM Cloud Service Discovery running on :%s\n", *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
+	// Add logging middleware
+	http.Handle("/", loggingMiddleware(http.DefaultServeMux))
+
+	server := &http.Server{
+		Addr: ":" + *port,
+	}
+
+	startServer(server) // Start server with graceful shutdown
 }
 
 func maskAccount(account string) string {
