@@ -1,27 +1,29 @@
 version: '3.8'
 
 services:
-  app:
-    image: custom-ibm-sd-configs:latest
+  ibm-sd-configs:
+    image: latest
     build: .
     ports:
-      - "8080:8080"
+      - "9000:9000"
+    volumes:
+      - ./config.json:/root/config.json
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Secure Redis password
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Set Secure Redis password
     depends_on:
       - redis
 
   redis:
-    image: redis:6.2
+    image: redis:7.4.2
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     command: ["redis-server", "--appendonly", "yes"]
     environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Secure Redis password
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-yourpassword} # Set Secure Redis password
 
 volumes:
   redis-data:

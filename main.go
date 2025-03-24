@@ -22,9 +22,11 @@ import (
 
 // Config structure
 type Config struct {
-	Accounts map[string]string `json:"accounts"`
-	Port     string            `json:"port"`
-	Regions  map[string]string `json:"regions"` // Add Port field
+	Accounts       map[string]string `json:"accounts"`
+	Port           string            `json:"port"`
+	Regions        map[string]string `json:"regions"`
+	ResourceGroups map[string]string `json:"resource_groups"` // Add ResourceGroups field
+	OutputSDFile   string            `json:"output_sd_file"`
 }
 
 // Instance struct
@@ -98,7 +100,7 @@ func getAPIKey(account string) (string, error) {
 	return "", fmt.Errorf("API key for account %s not found", account)
 }
 
-func fetchAllInstances(account string) ([]Instance, error) {
+func fetchAllInstances(account string, resourceGroups []string) ([]Instance, error) {
 	apiKey, err := getAPIKey(account)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API key: %v", err)
@@ -115,17 +117,19 @@ func fetchAllInstances(account string) ([]Instance, error) {
 	instanceChan := make(chan []Instance)
 
 	for _, region := range regions {
-		wg.Add(1)
-		go func(region string) {
-			defer wg.Done()
+		for _, resourceGroup := range resourceGroups {
+			wg.Add(1)
+			go func(region, resourceGroup string) {
+				defer wg.Done()
 
-			instances, err := fetchInstancesForRegion(apiKey, region, account)
-			if err != nil {
-				log.Printf("⚠️ Error fetching instances for region %s: %v", region, err)
-				return
-			}
-			instanceChan <- instances
-		}(region)
+				instances, err := fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup)
+				if err != nil {
+					log.Printf("⚠️ Error fetching instances for region %s and resource group %s: %v", region, resourceGroup, err)
+					return
+				}
+				instanceChan <- instances
+			}(region, resourceGroup)
+		}
 	}
 
 	// Collect results from goroutines
@@ -329,6 +333,89 @@ func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error)
 	return instances, nil
 }
 
+func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup string) ([]Instance, error) {
+	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
+	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{Authenticator: authenticator})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VPC service: %v", err)
+	}
+
+	vpcServiceURL := fmt.Sprintf("https://%s.iaas.cloud.ibm.com/v1", region)
+	vpcService.SetServiceURL(vpcServiceURL)
+	log.Printf("🔍 Fetching instances from %s in resource group %s", maskURL(vpcServiceURL), resourceGroup)
+
+	// Fetch Floating IPs (for public IP mapping)
+	floatingIPMap, err := fetchFloatingIPs(vpcService)
+	if err != nil {
+		log.Printf("⚠️ Warning: Could not fetch floating IPs for %s: %v", region, err)
+	}
+
+	instances := []Instance{}
+	options := vpcService.NewListInstancesOptions()
+	options.SetResourceGroupID(resourceGroup) // Set resource group ID
+
+	for {
+		result, response, err := vpcService.ListInstances(options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list instances in %s: %v (HTTP %d)", region, err, response.StatusCode)
+		}
+
+		for _, instance := range result.Instances {
+			var privateIP, publicIP string
+			for _, iface := range instance.NetworkInterfaces {
+				if iface.PrimaryIP != nil {
+					privateIP = *iface.PrimaryIP.Address
+				}
+				if ip, found := floatingIPMap[*iface.ID]; found {
+					publicIP = ip
+				}
+			}
+
+			profile := ""
+			if instance.Profile != nil && instance.Profile.Name != nil {
+				profile = *instance.Profile.Name
+			}
+
+			instances = append(instances, Instance{
+				Name:             *instance.Name,
+				ID:               *instance.ID,
+				Region:           region,
+				Account:          account,
+				Status:           *instance.Status,
+				AvailabilityZone: *instance.Zone.Name,
+				InstanceID:       *instance.CRN,
+				PrivateIP:        privateIP,
+				PublicIP:         publicIP,
+				Profile:          profile,
+			})
+		}
+
+		// 🔥 Fix: Extract the 'start' parameter safely
+		if result.Next != nil && result.Next.Href != nil {
+			nextURL, err := url.Parse(*result.Next.Href)
+			if err != nil {
+				log.Printf("⚠️ Warning: Failed to parse Next URL for region %s: %v", region, err)
+				break
+			}
+
+			queryParams := nextURL.Query()
+			startParam := queryParams.Get("start")
+
+			if startParam == "" {
+				log.Printf("⚠️ Warning: 'start' parameter missing in Next URL for region %s", region)
+				break
+			}
+			// 🔍 Add log statement to track pagination
+			log.Printf("🔍 Next pagination token for region %s: %s", region, maskToken(startParam))
+			options.SetStart(startParam) // ✅ Use extracted pagination token
+		} else {
+			break
+		}
+	}
+
+	return instances, nil
+}
+
 func fetchInstanceIPs(apiKey, region string) (map[string]Instance, error) {
 	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
 	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{Authenticator: authenticator})
@@ -434,8 +521,14 @@ func instanceHandler(w http.ResponseWriter, r *http.Request) {
 		regions = "us-east"
 	}
 
+	resourceGroups := r.URL.Query().Get("resource_groups")
+	if resourceGroups == "" {
+		resourceGroups = "default"
+	}
+
 	accountList := strings.Split(accounts, ",")
 	regionList := strings.Split(regions, ",")
+	resourceGroupList := strings.Split(resourceGroups, ",")
 	var allInstances []Instance
 	instanceCache := make(map[string]map[string]Instance) // Cache IPs per region
 
@@ -446,7 +539,7 @@ func instanceHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(account string) {
 			defer wg.Done()
-			instances, err := fetchInstances(account)
+			instances, err := fetchAllInstances(account, resourceGroupList)
 			if err != nil {
 				log.Printf("Error fetching instances for %s: %v", account, err)
 				return
@@ -594,10 +687,12 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
 	// regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
-	accounts := flag.String("accounts", viper.GetString("accounts"), "Comma-separated list of IBM Cloud accounts") // Use accounts from config.json
-	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")     // Use regions from config.json
-	port := flag.String("port", viper.GetString("port"), "Port to run the server on")                              // Use port from config.json
+	accounts := flag.String("accounts", viper.GetString("accounts"), "Comma-separated list of IBM Cloud accounts")                            // Use accounts from config.json
+	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")                                // Use regions from config.json
+	port := flag.String("port", viper.GetString("port"), "Port to run the server on")                                                         // Use port from config.json
+	resourceGroups := flag.String("resource_groups", viper.GetString("resource_groups"), "Comma-separated list of IBM Cloud resource groups") // Use resource groups from config.json
 	showVersion := flag.Bool("version", false, "Show tool version")
+	outputSDFile := flag.String("output-sd-file", "", "Path to output file_sd_configs JSON file")
 	flag.Parse()
 
 	if *showVersion {
@@ -612,8 +707,17 @@ func main() {
 	// 	return
 	// }
 
+	var config Config
+	// ...existing code to read config...
+
+	if *outputSDFile != "" {
+		config.OutputSDFile = *outputSDFile
+	}
+
+	writeSDConfig(config)
+
 	http.HandleFunc("/instances", func(w http.ResponseWriter, r *http.Request) {
-		r.URL.RawQuery = fmt.Sprintf("accounts=%s&regions=%s", *accounts, *regions)
+		r.URL.RawQuery = fmt.Sprintf("accounts=%s&regions=%s&resource_groups=%s", *accounts, *regions, *resourceGroups)
 		instanceHandler(w, r)
 	})
 
@@ -653,4 +757,26 @@ func maskIP(ip string) string {
 		return parts[0] + ".***.***." + parts[3]
 	}
 	return ip
+}
+
+func writeSDConfig(config Config) {
+	sdConfig := map[string]interface{}{
+		"targets": config.Accounts,
+		"labels": map[string]string{
+			"region": config.Regions["default"], // Use a valid key from the map
+		},
+	}
+
+	file, err := os.Create(config.OutputSDFile)
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(sdConfig); err != nil {
+		fmt.Println("Error encoding JSON:", err)
+	}
 }

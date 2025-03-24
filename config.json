@@ -1,5 +1,6 @@
 {
-	"accounts": ["account1", "account2", "account3"],
+	"accounts": ["account1"],
 	"regions": ["us-west-2"],
-	"port": 9000
+	"port": 9000,
+	"output_sd_file": "ibm_sd_configs.json"
 }
