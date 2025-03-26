@@ -11,7 +11,7 @@ TARGETS = \
 # Output directory for binaries
 OUTPUT_DIR = bin
 
-VERSION := 1.2.0
+VERSION := $(shell git describe --tags --always)
 
 all: clean build
 
@@ -20,7 +20,7 @@ clean:
 
 build: check-gox
 	mkdir -p $(OUTPUT_DIR)
-	gox -osarch="$(TARGETS)" -ldflags "-X main.version=$(VERSION)" -output="$(OUTPUT_DIR)/{{.Dir}}_{{.OS}}_{{.Arch}}" ./...
+	gox -osarch="$(TARGETS)" -ldflags "-X main.version=$(VERSION)" -output="$(OUTPUT_DIR)/{{.Dir}}_$(VERSION)_{{.OS}}_{{.Arch}}" ./...
 
 run:
 	go run -ldflags "-X main.version=$(VERSION)" main.go
