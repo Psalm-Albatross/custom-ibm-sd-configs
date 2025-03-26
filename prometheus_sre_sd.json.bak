@@ -1,6 +1,6 @@
 {
   "accounts": {
-    "default": "account3,account4,account1,account2"
+    "default": "account1,account2"
   },
   "port": "",
   "regions": {

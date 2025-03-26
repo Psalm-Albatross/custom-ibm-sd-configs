@@ -933,7 +933,7 @@ func main() {
 
 	// Fallback to default values if config.json is missing and arguments are not provided
 	if *accounts == "" {
-		*accounts = "account1,account2"
+		*accounts = strings.Join(getAllAccountsFromConfig(), ",")
 	}
 	if *regions == "" {
 		*regions = "us-east"
@@ -951,6 +951,14 @@ func main() {
 	// Log the configuration being used
 	log.Printf("✅ Using configuration: accounts=%s, regions=%s, port=%s, resource_groups=%s, output_sd_file=%s",
 		*accounts, *regions, *port, *resourceGroups, *outputSDFile)
+
+	// Log the source of each configuration
+	log.Printf("🔍 Configuration sources:")
+	log.Printf("   - Accounts: %s (from %s)", *accounts, getConfigSource("accounts"))
+	log.Printf("   - Regions: %s (from %s)", *regions, getConfigSource("regions"))
+	log.Printf("   - Port: %s (from %s)", *port, getConfigSource("port"))
+	log.Printf("   - Resource Groups: %s (from %s)", *resourceGroups, getConfigSource("resource_groups"))
+	log.Printf("   - Output SD File: %s (from %s)", *outputSDFile, getConfigSource("output_sd_file"))
 
 	// Create the Prometheus file-based service discovery JSON file if outputSDFile is provided
 	if *outputSDFile != "" {
@@ -985,6 +993,27 @@ func main() {
 		log.Printf("🌐 Starting HTTP server on :%s", *port)
 		log.Fatal(http.ListenAndServe(":"+*port, nil))
 	}
+}
+
+// Helper function to determine the source of a configuration
+func getConfigSource(key string) string {
+	if flag.Lookup(key) != nil && flag.Lookup(key).Value.String() != "" {
+		return "command-line argument"
+	}
+	if viper.IsSet(key) {
+		return "config.json"
+	}
+	return "default value"
+}
+
+// Helper function to retrieve all accounts from the config file
+func getAllAccountsFromConfig() []string {
+	accounts := viper.GetStringMapString("accounts")
+	var accountList []string
+	for account := range accounts {
+		accountList = append(accountList, account)
+	}
+	return accountList
 }
 
 func maskAccount(account string) string {

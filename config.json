@@ -2,7 +2,8 @@
   "accounts": {
     "account1": "api_key_1",
     "account2": "api_key_2",
-    "account3": "api_key_3"
+    "account3": "api_key_3",
+    "account4": "api_key_4"
   },
   "port": "9000",
   "regions": {
