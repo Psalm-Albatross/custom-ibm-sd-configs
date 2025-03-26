@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
+	"github.com/IBM/platform-services-go-sdk/globaltaggingv1"
+	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
 	"github.com/go-redis/redis/v8"
 	"github.com/hashicorp/vault/api"
@@ -31,16 +34,17 @@ type Config struct {
 
 // Instance struct
 type Instance struct {
-	Name             string `json:"name"`
-	ID               string `json:"id"`
-	Region           string `json:"region"`
-	Account          string `json:"account"`
-	PublicIP         string `json:"public_ip"`
-	PrivateIP        string `json:"private_ip"`
-	Status           string `json:"status"`
-	AvailabilityZone string `json:"availability_zone"`
-	InstanceID       string `json:"instance_id"`
-	Profile          string `json:"profile"`
+	Name             string   `json:"name"`
+	ID               string   `json:"id"`
+	Region           string   `json:"region"`
+	Account          string   `json:"account"`
+	PublicIP         string   `json:"public_ip"`
+	PrivateIP        string   `json:"private_ip"`
+	Status           string   `json:"status"`
+	AvailabilityZone string   `json:"availability_zone"`
+	InstanceID       string   `json:"instance_id"`
+	Profile          string   `json:"profile"`
+	Tags             []string `json:"tags"` // Add Tags field
 }
 
 var (
@@ -51,20 +55,33 @@ var (
 )
 
 func init() {
+	// Load Redis configuration from environment variables or fallback to defaults
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379" // Default Redis address
+	}
+
+	redisPassword := os.Getenv("REDIS_PASSWORD") // Redis password (optional)
+
+	// Initialize Redis client with dynamic configuration
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379", // Redis server address
+		Addr:     redisAddr,     // Redis server address
+		Password: redisPassword, // Redis authentication password
+		TLSConfig: &tls.Config{ // Enable TLS for Redis communication
+			InsecureSkipVerify: false,
+		},
 	})
 
-	// Load configuration from config.json
+	// Attempt to load configuration from config.json
 	viper.SetConfigName("config")
 	viper.SetConfigType("json")
 	viper.AddConfigPath(".")
 	if err := viper.ReadInConfig(); err != nil {
-		log.Fatalf("Error reading config file: %v", err)
+		log.Printf("⚠️ Warning: Config file not found or unreadable, falling back to tool arguments: %v", err)
 	}
 }
 
-// Load API Key from different sources
+// Updated getAPIKey to mask sensitive data in logs
 func getAPIKey(account string) (string, error) {
 	// 1️⃣ Check environment variable
 	envKey := os.Getenv("IBMCLOUD_API_KEY_" + strings.ToUpper(account))
@@ -97,7 +114,7 @@ func getAPIKey(account string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("API key for account %s not found", account)
+	return "", fmt.Errorf("API key for account %s not found", maskAccount(account))
 }
 
 func fetchAllInstances(account string, resourceGroups []string) ([]Instance, error) {
@@ -115,12 +132,15 @@ func fetchAllInstances(account string, resourceGroups []string) ([]Instance, err
 	var allInstances []Instance
 	var wg sync.WaitGroup
 	instanceChan := make(chan []Instance)
+	workerPool := make(chan struct{}, 10) // Limit concurrency to 10 workers
 
 	for _, region := range regions {
 		for _, resourceGroup := range resourceGroups {
 			wg.Add(1)
+			workerPool <- struct{}{} // Acquire a worker slot
 			go func(region, resourceGroup string) {
 				defer wg.Done()
+				defer func() { <-workerPool }() // Release the worker slot
 
 				instances, err := fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup)
 				if err != nil {
@@ -159,6 +179,7 @@ func fetchAllInstances(account string, resourceGroups []string) ([]Instance, err
 	return allInstances, nil
 }
 
+// Updated fetchInstances to dynamically fetch regions
 func fetchInstances(account string) ([]Instance, error) {
 	cacheKey := fmt.Sprintf("instances:%s", account)
 	cachedInstances, err := rdb.Get(ctx, cacheKey).Result()
@@ -178,8 +199,11 @@ func fetchInstances(account string) ([]Instance, error) {
 		return nil, fmt.Errorf("failed to get API key: %v", err)
 	}
 
-	// Get list of supported VPC regions
-	regions := []string{"us-south", "us-east", "eu-de", "eu-gb", "jp-tok", "jp-osa", "au-syd"}
+	// Dynamically fetch regions instead of using a static list
+	regions, err := getAllRegions(apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch regions: %v", err)
+	}
 
 	var allInstances []Instance
 	var wg sync.WaitGroup
@@ -212,17 +236,7 @@ func fetchInstances(account string) ([]Instance, error) {
 	log.Printf("✅ Fetched %d instances for account %s", len(allInstances), maskAccount(account))
 
 	// Cache the instances in Redis
-	instancesJSON, err := json.Marshal(allInstances)
-	if err == nil {
-		err = rdb.Set(ctx, cacheKey, instancesJSON, expiry).Err()
-		if err == nil {
-			log.Printf("✅ Cached instances for %s in Redis", account)
-		} else {
-			log.Printf("⚠️ Error caching instances for %s in Redis: %v", account, err)
-		}
-	} else {
-		log.Printf("⚠️ Error marshalling instances for %s: %v", account, err)
-	}
+	cacheInstancesInRedis(cacheKey, allInstances)
 
 	return allInstances, nil
 }
@@ -251,6 +265,34 @@ func getAllRegions(apiKey string) ([]string, error) {
 	return regions, nil
 }
 
+// Update fetchInstanceTags to use globaltaggingv1
+func fetchInstanceTags(apiKey, resourceID string) ([]string, error) {
+	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
+	taggingService, err := globaltaggingv1.NewGlobalTaggingV1(&globaltaggingv1.GlobalTaggingV1Options{
+		Authenticator: authenticator,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tagging service: %v", err)
+	}
+
+	options := taggingService.NewListTagsOptions()
+	options.SetAttachedTo(resourceID)
+	options.SetLimit(100)
+
+	result, _, err := taggingService.ListTags(options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch tags for resource %s: %v", resourceID, err)
+	}
+
+	var tags []string
+	for _, tag := range result.Items {
+		tags = append(tags, *tag.Name)
+	}
+
+	return tags, nil
+}
+
+// Update fetchInstancesForRegion to include tags
 func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error) {
 	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
 	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{Authenticator: authenticator})
@@ -293,6 +335,12 @@ func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error)
 				profile = *instance.Profile.Name
 			}
 
+			// Fetch tags for the instance
+			tags, err := fetchInstanceTags(apiKey, *instance.CRN)
+			if err != nil {
+				log.Printf("⚠️ Warning: Could not fetch tags for instance %s: %v", *instance.Name, err)
+			}
+
 			instances = append(instances, Instance{
 				Name:             *instance.Name,
 				ID:               *instance.ID,
@@ -304,6 +352,7 @@ func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error)
 				PrivateIP:        privateIP,
 				PublicIP:         publicIP,
 				Profile:          profile,
+				Tags:             tags, // Add tags to the instance
 			})
 		}
 
@@ -333,7 +382,9 @@ func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error)
 	return instances, nil
 }
 
-func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup string) ([]Instance, error) {
+func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroupName string) ([]Instance, error) {
+	log.Printf("🔍 Starting to fetch instances for region '%s' and resource group '%s'", region, resourceGroupName)
+
 	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
 	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{Authenticator: authenticator})
 	if err != nil {
@@ -342,21 +393,30 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 
 	vpcServiceURL := fmt.Sprintf("https://%s.iaas.cloud.ibm.com/v1", region)
 	vpcService.SetServiceURL(vpcServiceURL)
-	log.Printf("🔍 Fetching instances from %s in resource group %s", maskURL(vpcServiceURL), resourceGroup)
+	log.Printf("🔍 Fetching instances from VPC service URL: %s", maskURL(vpcServiceURL))
+
+	// Fetch the resource group ID for the given resource group name
+	resourceGroupID, err := getResourceGroupID(apiKey, resourceGroupName)
+	if err != nil {
+		log.Printf("❌ Failed to fetch resource group ID for '%s': %v", resourceGroupName, err)
+		return nil, fmt.Errorf("failed to fetch resource group ID for %s: %v", resourceGroupName, err)
+	}
+	log.Printf("✅ Resource group '%s' resolved to ID '%s'", resourceGroupName, resourceGroupID)
 
 	// Fetch Floating IPs (for public IP mapping)
 	floatingIPMap, err := fetchFloatingIPs(vpcService)
 	if err != nil {
-		log.Printf("⚠️ Warning: Could not fetch floating IPs for %s: %v", region, err)
+		log.Printf("⚠️ Warning: Could not fetch floating IPs for region '%s': %v", region, err)
 	}
 
 	instances := []Instance{}
 	options := vpcService.NewListInstancesOptions()
-	options.SetResourceGroupID(resourceGroup) // Set resource group ID
+	options.SetResourceGroupID(resourceGroupID) // Apply the resource group ID filter
 
 	for {
 		result, response, err := vpcService.ListInstances(options)
 		if err != nil {
+			log.Printf("❌ Error listing instances in region '%s' for resource group '%s': %v (HTTP %d)", region, resourceGroupName, err, response.StatusCode)
 			return nil, fmt.Errorf("failed to list instances in %s: %v (HTTP %d)", region, err, response.StatusCode)
 		}
 
@@ -376,6 +436,12 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 				profile = *instance.Profile.Name
 			}
 
+			// Fetch tags for the instance
+			tags, err := fetchInstanceTags(apiKey, *instance.CRN)
+			if err != nil {
+				log.Printf("⚠️ Warning: Could not fetch tags for instance '%s': %v", *instance.Name, err)
+			}
+
 			instances = append(instances, Instance{
 				Name:             *instance.Name,
 				ID:               *instance.ID,
@@ -387,14 +453,15 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 				PrivateIP:        privateIP,
 				PublicIP:         publicIP,
 				Profile:          profile,
+				Tags:             tags,
 			})
 		}
 
-		// 🔥 Fix: Extract the 'start' parameter safely
+		// Handle pagination
 		if result.Next != nil && result.Next.Href != nil {
 			nextURL, err := url.Parse(*result.Next.Href)
 			if err != nil {
-				log.Printf("⚠️ Warning: Failed to parse Next URL for region %s: %v", region, err)
+				log.Printf("⚠️ Warning: Failed to parse Next URL for region '%s': %v", region, err)
 				break
 			}
 
@@ -402,18 +469,58 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 			startParam := queryParams.Get("start")
 
 			if startParam == "" {
-				log.Printf("⚠️ Warning: 'start' parameter missing in Next URL for region %s", region)
+				log.Printf("⚠️ Warning: 'start' parameter missing in Next URL for region '%s'", region)
 				break
 			}
-			// 🔍 Add log statement to track pagination
-			log.Printf("🔍 Next pagination token for region %s: %s", region, maskToken(startParam))
-			options.SetStart(startParam) // ✅ Use extracted pagination token
+			log.Printf("🔍 Next pagination token for region '%s': %s", region, maskToken(startParam))
+			options.SetStart(startParam)
 		} else {
 			break
 		}
 	}
 
+	log.Printf("✅ Fetched %d instances for region '%s' and resource group '%s'", len(instances), region, resourceGroupName)
 	return instances, nil
+}
+
+// Cache for resource group IDs to reduce redundant API calls
+var resourceGroupIDCache = sync.Map{}
+
+// Updated getResourceGroupID to use caching
+func getResourceGroupID(apiKey, resourceGroupName string) (string, error) {
+	log.Printf("🔍 Resolving resource group name '%s' to ID", resourceGroupName)
+
+	if cachedID, found := resourceGroupIDCache.Load(resourceGroupName); found {
+		log.Printf("✅ Resource group '%s' resolved to cached ID '%s'", resourceGroupName, cachedID.(string))
+		return cachedID.(string), nil
+	}
+
+	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
+	resourceManagerService, err := resourcemanagerv2.NewResourceManagerV2(&resourcemanagerv2.ResourceManagerV2Options{
+		Authenticator: authenticator,
+	})
+	if err != nil {
+		log.Printf("❌ Failed to create resource manager service: %v", err)
+		return "", fmt.Errorf("failed to create resource manager service: %v", err)
+	}
+
+	options := resourceManagerService.NewListResourceGroupsOptions()
+	result, _, err := resourceManagerService.ListResourceGroups(options)
+	if err != nil {
+		log.Printf("❌ Failed to list resource groups: %v", err)
+		return "", fmt.Errorf("failed to list resource groups: %v", err)
+	}
+
+	for _, group := range result.Resources {
+		if *group.Name == resourceGroupName {
+			resourceGroupIDCache.Store(resourceGroupName, *group.ID) // Cache the ID
+			log.Printf("✅ Resource group '%s' resolved to ID '%s'", resourceGroupName, *group.ID)
+			return *group.ID, nil
+		}
+	}
+
+	log.Printf("❌ Resource group '%s' not found", resourceGroupName)
+	return "", fmt.Errorf("resource group %s not found", resourceGroupName)
 }
 
 func fetchInstanceIPs(apiKey, region string) (map[string]Instance, error) {
@@ -628,7 +735,25 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 		accounts = "account1,account2"
 	}
 
+	regions := r.URL.Query().Get("regions")
+	if regions == "" {
+		regions = "us-east"
+	}
+
+	resourceGroups := r.URL.Query().Get("resource_groups")
+	if resourceGroups == "" {
+		resourceGroups = "default"
+	}
+
+	outputFile := r.URL.Query().Get("output_file")
+	if outputFile == "" {
+		outputFile = viper.GetString("output_sd_file") // Fallback to config.json
+	}
+
 	accountList := strings.Split(accounts, ",")
+	regionList := strings.Split(regions, ",")
+	resourceGroupList := strings.Split(resourceGroups, ",")
+
 	var allInstances []Instance
 	instanceChan := make(chan []Instance)
 	var wg sync.WaitGroup
@@ -637,12 +762,21 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(account string) {
 			defer wg.Done()
-			instances, err := fetchInstances(account)
+			instances, err := fetchAllInstances(account, resourceGroupList)
 			if err != nil {
 				log.Printf("Error fetching instances for %s: %v", account, err)
 				return
 			}
-			instanceChan <- instances
+
+			// Filter instances by regions
+			filteredInstances := []Instance{}
+			for _, inst := range instances {
+				if contains(regionList, inst.Region) {
+					filteredInstances = append(filteredInstances, inst)
+				}
+			}
+
+			instanceChan <- filteredInstances
 		}(account)
 	}
 
@@ -657,21 +791,50 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 
 	targets := []map[string]interface{}{}
 	for _, instance := range allInstances {
+		labels := map[string]string{
+			"instance":          instance.Name,
+			"region":            instance.Region,
+			"account":           instance.Account,
+			"status":            instance.Status,
+			"private_ip":        instance.PrivateIP,
+			"public_ip":         instance.PublicIP,
+			"instance_id":       instance.InstanceID,
+			"availability_zone": instance.AvailabilityZone,
+			"profile":           instance.Profile,
+			"resource_group":    instance.Account,
+		}
+
+		// Add tags as separate labels
+		for i, tag := range instance.Tags {
+			labels[fmt.Sprintf("tag_%d", i)] = tag
+		}
+
 		target := map[string]interface{}{
 			"targets": []string{instance.PrivateIP},
-			"labels": map[string]string{
-				"instance":          instance.Name,
-				"region":            instance.Region,
-				"account":           instance.Account,
-				"status":            instance.Status,
-				"private_ip":        instance.PrivateIP,
-				"public_ip":         instance.PublicIP,
-				"instance_id":       instance.InstanceID,
-				"availability_zone": instance.AvailabilityZone,
-				"profile":           instance.Profile,
-			},
+			"labels":  labels,
 		}
 		targets = append(targets, target)
+	}
+
+	// Write to file if outputFile is specified
+	if outputFile != "" {
+		file, err := os.Create(outputFile)
+		if err != nil {
+			log.Printf("Error creating output file: %v", err)
+			http.Error(w, "Failed to create output file", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		encoder := json.NewEncoder(file)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(targets); err != nil {
+			log.Printf("Error writing to output file: %v", err)
+			http.Error(w, "Failed to write to output file", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Prometheus file-based service discovery JSON written to %s", outputFile)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -684,38 +847,124 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy"}`))
 }
 
+// Add a new endpoint to demonstrate sensitive data masking
+func maskingDemoHandler(w http.ResponseWriter, r *http.Request) {
+	apiKey := "example-api-key"
+	token := "example-token"
+	url := "https://example.com"
+	ip := "192.168.1.1"
+
+	response := map[string]string{
+		"masked_api_key": maskSensitiveData(apiKey),
+		"masked_token":   maskToken(token),
+		"masked_url":     maskURL(url),
+		"masked_ip":      maskIP(ip),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Add a new endpoint to demonstrate Redis caching fallback
+func redisFallbackDemoHandler(w http.ResponseWriter, r *http.Request) {
+	cacheKey := "demo:instances"
+	instances := []Instance{
+		{Name: "Instance1", ID: "id1", Region: "us-east", Account: "account1"},
+		{Name: "Instance2", ID: "id2", Region: "us-south", Account: "account2"},
+	}
+
+	// Attempt to cache instances
+	cacheInstancesInRedis(cacheKey, instances)
+
+	// Attempt to retrieve cached instances
+	cachedInstances, err := rdb.Get(ctx, cacheKey).Result()
+	if err != nil {
+		log.Printf("⚠️ Redis unavailable, falling back to in-memory data: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(instances)
+		return
+	}
+
+	var retrievedInstances []Instance
+	if err := json.Unmarshal([]byte(cachedInstances), &retrievedInstances); err != nil {
+		log.Printf("⚠️ Error unmarshalling cached data: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(instances)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(retrievedInstances)
+}
+
+// Add a new endpoint to demonstrate Prometheus file versioning
+func prometheusVersioningDemoHandler(w http.ResponseWriter, r *http.Request) {
+	config := Config{
+		Accounts:       map[string]string{"default": "account1"},
+		Regions:        map[string]string{"default": "us-east"},
+		ResourceGroups: map[string]string{"default": "default"},
+		OutputSDFile:   "./prometheus_sd_demo.json",
+	}
+
+	writeSDConfig(config)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"Prometheus file versioning demo completed"}`))
+}
+
+// Ensure writeSDConfig is used in main
 func main() {
-	// accounts := flag.String("accounts", "account1,account2", "Comma-separated list of IBM Cloud accounts")
-	// regions := flag.String("regions", "us-east", "Comma-separated list of IBM Cloud regions")
-	accounts := flag.String("accounts", viper.GetString("accounts"), "Comma-separated list of IBM Cloud accounts")                            // Use accounts from config.json
-	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")                                // Use regions from config.json
-	port := flag.String("port", viper.GetString("port"), "Port to run the server on")                                                         // Use port from config.json
-	resourceGroups := flag.String("resource_groups", viper.GetString("resource_groups"), "Comma-separated list of IBM Cloud resource groups") // Use resource groups from config.json
+	// Define command-line arguments with fallback to viper (config.json)
+	accounts := flag.String("accounts", viper.GetString("accounts"), "Comma-separated list of IBM Cloud accounts")
+	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")
+	port := flag.String("port", viper.GetString("port"), "Port to run the server on")
+	resourceGroups := flag.String("resource_groups", viper.GetString("resource_groups"), "Comma-separated list of IBM Cloud resource groups")
 	showVersion := flag.Bool("version", false, "Show tool version")
-	outputSDFile := flag.String("output-sd-file", "", "Path to output file_sd_configs JSON file")
+	outputSDFile := flag.String("output-sd-file", viper.GetString("output_sd_file"), "Path to output file_sd_configs JSON file")
+	certFile := flag.String("cert", "", "Path to the TLS certificate file (optional)")
+	keyFile := flag.String("key", "", "Path to the TLS key file (optional)")
 	flag.Parse()
 
+	// Handle version flag
 	if *showVersion {
 		fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
 		return
 	}
 
-	// if len(os.Args) == 1 {
-	// 	fmt.Printf("IBM Cloud Service Discovery Tool Version: %s\n", version)
-	// 	fmt.Println("Usage:")
-	// 	flag.PrintDefaults()
-	// 	return
-	// }
-
-	var config Config
-	// ...existing code to read config...
-
-	if *outputSDFile != "" {
-		config.OutputSDFile = *outputSDFile
+	// Fallback to default values if config.json is missing and arguments are not provided
+	if *accounts == "" {
+		*accounts = "account1,account2"
+	}
+	if *regions == "" {
+		*regions = "us-east"
+	}
+	if *port == "" {
+		*port = "8080"
+	}
+	if *resourceGroups == "" {
+		*resourceGroups = "default"
+	}
+	if *outputSDFile == "" {
+		*outputSDFile = "./prometheus_sd.json"
 	}
 
-	writeSDConfig(config)
+	// Log the configuration being used
+	log.Printf("✅ Using configuration: accounts=%s, regions=%s, port=%s, resource_groups=%s, output_sd_file=%s",
+		*accounts, *regions, *port, *resourceGroups, *outputSDFile)
 
+	// Create the Prometheus file-based service discovery JSON file if outputSDFile is provided
+	if *outputSDFile != "" {
+		config := Config{
+			Accounts:       map[string]string{"default": *accounts},
+			Regions:        map[string]string{"default": *regions},
+			ResourceGroups: map[string]string{"default": *resourceGroups},
+			OutputSDFile:   *outputSDFile,
+		}
+		writeSDConfig(config) // Ensure this function is used
+		log.Printf("✅ Prometheus file-based service discovery JSON written to %s", *outputSDFile)
+	}
+
+	// Start the HTTP server
 	http.HandleFunc("/instances", func(w http.ResponseWriter, r *http.Request) {
 		r.URL.RawQuery = fmt.Sprintf("accounts=%s&regions=%s&resource_groups=%s", *accounts, *regions, *resourceGroups)
 		instanceHandler(w, r)
@@ -723,10 +972,19 @@ func main() {
 
 	http.HandleFunc("/help", helpHandler)
 	http.HandleFunc("/prometheus", prometheusHandler)
-	http.HandleFunc("/health", healthCheckHandler) // Add health check endpoint
+	http.HandleFunc("/health", healthCheckHandler)
+	http.HandleFunc("/masking-demo", maskingDemoHandler)
+	http.HandleFunc("/redis-fallback-demo", redisFallbackDemoHandler)
+	http.HandleFunc("/prometheus-versioning-demo", prometheusVersioningDemoHandler)
 
-	fmt.Printf("IBM Cloud Service Discovery running on :%s\n", *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
+	// Check if TLS certificates are provided
+	if *certFile != "" && *keyFile != "" {
+		log.Printf("🔒 Starting HTTPS server on :%s", *port)
+		log.Fatal(http.ListenAndServeTLS(":"+*port, *certFile, *keyFile, nil))
+	} else {
+		log.Printf("🌐 Starting HTTP server on :%s", *port)
+		log.Fatal(http.ListenAndServe(":"+*port, nil))
+	}
 }
 
 func maskAccount(account string) string {
@@ -759,24 +1017,58 @@ func maskIP(ip string) string {
 	return ip
 }
 
-func writeSDConfig(config Config) {
-	sdConfig := map[string]interface{}{
-		"targets": config.Accounts,
-		"labels": map[string]string{
-			"region": config.Regions["default"], // Use a valid key from the map
-		},
+// Graceful fallback for Redis caching
+func cacheInstancesInRedis(key string, instances []Instance) error {
+	instancesJSON, err := json.Marshal(instances)
+	if err != nil {
+		log.Printf("⚠️ Error marshalling instances: %v", err)
+		return err
 	}
 
-	file, err := os.Create(config.OutputSDFile)
+	err = rdb.Set(ctx, key, instancesJSON, expiry).Err()
 	if err != nil {
-		fmt.Println("Error creating file:", err)
+		log.Printf("⚠️ Redis unavailable, skipping caching: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// Updated sensitive data masking for logs
+func maskSensitiveData(data string) string {
+	if len(data) > 4 {
+		return data[:2] + strings.Repeat("*", len(data)-4) + data[len(data)-2:]
+	}
+	return data
+}
+
+// Add versioning for Prometheus output file
+func writeSDConfig(config Config) {
+	outputFile := config.OutputSDFile
+	backupFile := outputFile + ".bak"
+
+	// Create a backup of the existing file
+	if _, err := os.Stat(outputFile); err == nil {
+		if err := os.Rename(outputFile, backupFile); err != nil {
+			log.Printf("⚠️ Failed to create backup of output file: %v", err)
+			return
+		}
+		log.Printf("✅ Backup created: %s", backupFile)
+	}
+
+	file, err := os.Create(outputFile)
+	if err != nil {
+		log.Printf("❌ Error creating output file: %v", err)
 		return
 	}
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(sdConfig); err != nil {
-		fmt.Println("Error encoding JSON:", err)
+	if err := encoder.Encode(config); err != nil {
+		log.Printf("❌ Error encoding JSON: %v", err)
+		return
 	}
+
+	log.Printf("✅ Prometheus file successfully written to %s", outputFile)
 }

@@ -1,6 +1,15 @@
 {
-	"accounts": ["account1"],
-	"regions": ["us-west-2"],
-	"port": 9000,
-	"output_sd_file": "ibm_sd_configs.json"
+  "accounts": {
+    "account1": "api_key_1",
+    "account2": "api_key_2",
+    "account3": "api_key_3"
+  },
+  "port": "9000",
+  "regions": {
+    "default": "us-east"
+  },
+  "resource_groups": {
+    "default": "rg-sand-wa"
+  },
+  "output_sd_file": "./prometheus_sre_sd.json"
 }

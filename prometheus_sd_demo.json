@@ -1,0 +1,13 @@
+{
+  "accounts": {
+    "default": "account1"
+  },
+  "port": "",
+  "regions": {
+    "default": "us-east"
+  },
+  "resource_groups": {
+    "default": "default"
+  },
+  "output_sd_file": "./prometheus_sd_demo.json"
+}
