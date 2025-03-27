@@ -1,16 +1,8 @@
 {
-  "accounts": {
-    "account1": "api_key_1",
-    "account2": "api_key_2",
-    "account3": "api_key_3",
-    "account4": "api_key_4"
-  },
+  "accounts": "account1",
+  "regions": "us-east",
   "port": "9000",
-  "regions": {
-    "default": "us-east"
-  },
-  "resource_groups": {
-    "default": "rg-sand-wa"
-  },
-  "output_sd_file": "./prometheus_sre_sd.json"
+  "resource_groups": "default",
+  "output_sd_file": "./prometheus_sd.json",
+  "account_ids": "xxxxxxxxxxxx"
 }

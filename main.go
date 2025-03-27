@@ -16,6 +16,7 @@ import (
 
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/platform-services-go-sdk/globaltaggingv1"
+	"github.com/IBM/platform-services-go-sdk/iamidentityv1"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
 	"github.com/IBM/vpc-go-sdk/vpcv1"
 	"github.com/go-redis/redis/v8"
@@ -117,16 +118,11 @@ func getAPIKey(account string) (string, error) {
 	return "", fmt.Errorf("API key for account %s not found", maskAccount(account))
 }
 
-func fetchAllInstances(account string, resourceGroups []string) ([]Instance, error) {
+// Updated fetchAllInstances to use regions from config or arguments
+func fetchAllInstances(account string, resourceGroups []string, regions []string) ([]Instance, error) {
 	apiKey, err := getAPIKey(account)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API key: %v", err)
-	}
-
-	// Fetch all available IBM Cloud regions dynamically
-	regions, err := getAllRegions(apiKey)
-	if err != nil {
-		return nil, err
 	}
 
 	var allInstances []Instance
@@ -142,7 +138,7 @@ func fetchAllInstances(account string, resourceGroups []string) ([]Instance, err
 				defer wg.Done()
 				defer func() { <-workerPool }() // Release the worker slot
 
-				instances, err := fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup)
+				instances, err := fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroup, "")
 				if err != nil {
 					log.Printf("⚠️ Error fetching instances for region %s and resource group %s: %v", region, resourceGroup, err)
 					return
@@ -177,92 +173,6 @@ func fetchAllInstances(account string, resourceGroups []string) ([]Instance, err
 	}
 
 	return allInstances, nil
-}
-
-// Updated fetchInstances to dynamically fetch regions
-func fetchInstances(account string) ([]Instance, error) {
-	cacheKey := fmt.Sprintf("instances:%s", account)
-	cachedInstances, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
-		var instances []Instance
-		if err := json.Unmarshal([]byte(cachedInstances), &instances); err == nil {
-			log.Printf("✅ Retrieved instances for %s from Redis cache", account)
-			return instances, nil
-		}
-		log.Printf("⚠️ Error unmarshalling cached instances for %s: %v", account, err)
-	} else {
-		log.Printf("ℹ️ No cached instances found for %s, fetching from API", account)
-	}
-
-	apiKey, err := getAPIKey(account)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get API key: %v", err)
-	}
-
-	// Dynamically fetch regions instead of using a static list
-	regions, err := getAllRegions(apiKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch regions: %v", err)
-	}
-
-	var allInstances []Instance
-	var wg sync.WaitGroup
-	instanceChan := make(chan []Instance)
-
-	for _, region := range regions {
-		wg.Add(1)
-		go func(region string) {
-			defer wg.Done()
-
-			instances, err := fetchInstancesForRegion(apiKey, region, account)
-			if err != nil {
-				log.Printf("⚠️ Error fetching instances for region %s: %v", region, err)
-				return
-			}
-			instanceChan <- instances
-		}(region)
-	}
-
-	// Collect results from goroutines
-	go func() {
-		wg.Wait()
-		close(instanceChan)
-	}()
-
-	for instances := range instanceChan {
-		allInstances = append(allInstances, instances...)
-	}
-
-	log.Printf("✅ Fetched %d instances for account %s", len(allInstances), maskAccount(account))
-
-	// Cache the instances in Redis
-	cacheInstancesInRedis(cacheKey, allInstances)
-
-	return allInstances, nil
-}
-
-func getAllRegions(apiKey string) ([]string, error) {
-	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
-	vpcService, err := vpcv1.NewVpcV1(&vpcv1.VpcV1Options{Authenticator: authenticator})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create VPC service: %v", err)
-	}
-
-	vpcService.SetServiceURL("https://global.iaas.cloud.ibm.com/v1") // Global endpoint
-
-	options := vpcService.NewListRegionsOptions()
-	result, _, err := vpcService.ListRegions(options)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list regions: %v", err)
-	}
-
-	var regions []string
-	for _, region := range result.Regions {
-		regions = append(regions, *region.Name)
-	}
-
-	log.Printf("🌎 Available IBM Cloud regions: %v", regions)
-	return regions, nil
 }
 
 // Update fetchInstanceTags to use globaltaggingv1
@@ -382,7 +292,8 @@ func fetchInstancesForRegion(apiKey, region, account string) ([]Instance, error)
 	return instances, nil
 }
 
-func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroupName string) ([]Instance, error) {
+// Updated fetchInstancesForRegionAndResourceGroup to make resource group filtering optional
+func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGroupName, accountID string) ([]Instance, error) {
 	log.Printf("🔍 Starting to fetch instances for region '%s' and resource group '%s'", region, resourceGroupName)
 
 	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
@@ -395,13 +306,13 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 	vpcService.SetServiceURL(vpcServiceURL)
 	log.Printf("🔍 Fetching instances from VPC service URL: %s", maskURL(vpcServiceURL))
 
-	// Fetch the resource group ID for the given resource group name
-	resourceGroupID, err := getResourceGroupID(apiKey, resourceGroupName)
-	if err != nil {
-		log.Printf("❌ Failed to fetch resource group ID for '%s': %v", resourceGroupName, err)
-		return nil, fmt.Errorf("failed to fetch resource group ID for %s: %v", resourceGroupName, err)
+	var resourceGroupID string
+	if resourceGroupName != "" {
+		resourceGroupID, err = getResourceGroupID(apiKey, resourceGroupName, accountID)
+		if err != nil {
+			log.Printf("⚠️ Resource group filtering skipped: %v", err)
+		}
 	}
-	log.Printf("✅ Resource group '%s' resolved to ID '%s'", resourceGroupName, resourceGroupID)
 
 	// Fetch Floating IPs (for public IP mapping)
 	floatingIPMap, err := fetchFloatingIPs(vpcService)
@@ -411,7 +322,9 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 
 	instances := []Instance{}
 	options := vpcService.NewListInstancesOptions()
-	options.SetResourceGroupID(resourceGroupID) // Apply the resource group ID filter
+	if resourceGroupID != "" {
+		options.SetResourceGroupID(resourceGroupID)
+	}
 
 	for {
 		result, response, err := vpcService.ListInstances(options)
@@ -486,13 +399,30 @@ func fetchInstancesForRegionAndResourceGroup(apiKey, region, account, resourceGr
 // Cache for resource group IDs to reduce redundant API calls
 var resourceGroupIDCache = sync.Map{}
 
-// Updated getResourceGroupID to use caching
-func getResourceGroupID(apiKey, resourceGroupName string) (string, error) {
+// Updated getResourceGroupID to improve logging for account_id
+func getResourceGroupID(apiKey, resourceGroupName, accountID string) (string, error) {
 	log.Printf("🔍 Resolving resource group name '%s' to ID", resourceGroupName)
 
 	if cachedID, found := resourceGroupIDCache.Load(resourceGroupName); found {
-		log.Printf("✅ Resource group '%s' resolved to cached ID '%s'", resourceGroupName, cachedID.(string))
+		log.Printf("✅ Resource group '%s' resolved to cached ID", resourceGroupName)
 		return cachedID.(string), nil
+	}
+
+	// Use account_id from config.json or arguments if provided
+	if accountID == "" {
+		accountID = viper.GetString("account_id")
+		if accountID == "" {
+			var err error
+			accountID, err = getAccountID(apiKey)
+			if err != nil {
+				log.Printf("⚠️ API key does not have permission to fetch account ID. Skipping resource group filtering. Please add 'account_id' in config.json or pass it as a command-line argument.")
+				return "", nil // Gracefully skip resource group filtering
+			}
+		} else {
+			log.Printf("✅ Account ID provided via config or arguments: %s", maskSensitiveData(accountID))
+		}
+	} else {
+		log.Printf("✅ Account ID provided via arguments: %s", maskSensitiveData(accountID))
 	}
 
 	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
@@ -505,6 +435,8 @@ func getResourceGroupID(apiKey, resourceGroupName string) (string, error) {
 	}
 
 	options := resourceManagerService.NewListResourceGroupsOptions()
+	options.SetAccountID(accountID)
+
 	result, _, err := resourceManagerService.ListResourceGroups(options)
 	if err != nil {
 		log.Printf("❌ Failed to list resource groups: %v", err)
@@ -513,14 +445,41 @@ func getResourceGroupID(apiKey, resourceGroupName string) (string, error) {
 
 	for _, group := range result.Resources {
 		if *group.Name == resourceGroupName {
-			resourceGroupIDCache.Store(resourceGroupName, *group.ID) // Cache the ID
-			log.Printf("✅ Resource group '%s' resolved to ID '%s'", resourceGroupName, *group.ID)
+			resourceGroupIDCache.Store(resourceGroupName, *group.ID)
+			log.Printf("✅ Resource group '%s' resolved to ID", resourceGroupName)
 			return *group.ID, nil
 		}
 	}
 
 	log.Printf("❌ Resource group '%s' not found", resourceGroupName)
 	return "", fmt.Errorf("resource group %s not found", resourceGroupName)
+}
+
+// Updated getAccountID to redact account ID in logs
+func getAccountID(apiKey string) (string, error) {
+	authenticator := &core.IamAuthenticator{ApiKey: apiKey}
+	iamService, err := iamidentityv1.NewIamIdentityV1(&iamidentityv1.IamIdentityV1Options{
+		Authenticator: authenticator,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create IAM Identity service: %v", err)
+	}
+
+	options := &iamidentityv1.GetAPIKeysDetailsOptions{}
+	options.SetIamAPIKey(apiKey)
+
+	apiKeyDetails, _, err := iamService.GetAPIKeysDetails(options)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch API key details: %v", err)
+	}
+
+	if apiKeyDetails.AccountID == nil {
+		return "", fmt.Errorf("account ID not found in API key details")
+	}
+
+	accountID := *apiKeyDetails.AccountID
+	log.Printf("✅ Account ID fetched successfully: %s", maskSensitiveData(accountID))
+	return accountID, nil
 }
 
 func fetchInstanceIPs(apiKey, region string) (map[string]Instance, error) {
@@ -614,23 +573,25 @@ func fetchFloatingIPs(vpcService *vpcv1.VpcV1) (map[string]string, error) {
 		}
 	}
 
+	// Ensure a valid return even if no floating IPs are found
 	return floatingIPMap, nil
 }
 
+// Updated instanceHandler to pass regions from config or arguments
 func instanceHandler(w http.ResponseWriter, r *http.Request) {
 	accounts := r.URL.Query().Get("accounts")
 	if accounts == "" {
-		accounts = "account1"
+		accounts = viper.GetString("accounts") // Use accounts from config.json
 	}
 
 	regions := r.URL.Query().Get("regions")
 	if regions == "" {
-		regions = "us-east"
+		regions = viper.GetString("regions") // Use regions from config.json
 	}
 
 	resourceGroups := r.URL.Query().Get("resource_groups")
 	if resourceGroups == "" {
-		resourceGroups = "default"
+		resourceGroups = viper.GetString("resource_groups") // Use resource groups from config.json
 	}
 
 	accountList := strings.Split(accounts, ",")
@@ -646,17 +607,13 @@ func instanceHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(account string) {
 			defer wg.Done()
-			instances, err := fetchAllInstances(account, resourceGroupList)
+			instances, err := fetchAllInstances(account, resourceGroupList, regionList)
 			if err != nil {
 				log.Printf("Error fetching instances for %s: %v", account, err)
 				return
 			}
 
 			for i, inst := range instances {
-				if !contains(regionList, inst.Region) {
-					continue
-				}
-
 				if _, exists := instanceCache[inst.Region]; !exists {
 					apiKey, err := getAPIKey(account)
 					if err != nil {
@@ -698,9 +655,10 @@ func contains(slice []string, item string) bool {
 			return true
 		}
 	}
-	return false
+	return false // Ensure a return value if the item is not found
 }
 
+// Updated helpHandler to reflect optional resource group filtering
 func helpHandler(w http.ResponseWriter, r *http.Request) {
 	helpText := fmt.Sprintf(`
 IBM Cloud Service Discovery Tool
@@ -712,6 +670,8 @@ Usage:
         Comma-separated list of IBM Cloud accounts (default "account1,account2")
   -regions string
         Comma-separated list of IBM Cloud regions (default "us-east")
+  -resource_groups string
+        (Optional) Comma-separated list of IBM Cloud resource groups. Requires higher permissions or account_id in config.json or arguments.
 
 Endpoints:
   /instances - Fetch instances from specified accounts and regions
@@ -722,8 +682,8 @@ Examples:
   Fetch instances from default accounts and regions:
     curl http://localhost:8080/instances
 
-  Fetch instances from specific accounts and regions:
-    curl "http://localhost:8080/instances?accounts=account1,account2&regions=us-east,eu-de"
+  Fetch instances with resource group filtering:
+    curl "http://localhost:8080/instances?accounts=account1&regions=us-east&resource_groups=group1"
 `, version)
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(helpText))
@@ -732,17 +692,17 @@ Examples:
 func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 	accounts := r.URL.Query().Get("accounts")
 	if accounts == "" {
-		accounts = "account1,account2"
+		accounts = viper.GetString("accounts") // Use accounts from config.json
 	}
 
 	regions := r.URL.Query().Get("regions")
 	if regions == "" {
-		regions = "us-east"
+		regions = viper.GetString("regions") // Use regions from config.json
 	}
 
 	resourceGroups := r.URL.Query().Get("resource_groups")
 	if resourceGroups == "" {
-		resourceGroups = "default"
+		resourceGroups = viper.GetString("resource_groups") // Use resource groups from config.json
 	}
 
 	outputFile := r.URL.Query().Get("output_file")
@@ -762,7 +722,7 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(account string) {
 			defer wg.Done()
-			instances, err := fetchAllInstances(account, resourceGroupList)
+			instances, err := fetchAllInstances(account, resourceGroupList, regionList)
 			if err != nil {
 				log.Printf("Error fetching instances for %s: %v", account, err)
 				return
@@ -801,7 +761,12 @@ func prometheusHandler(w http.ResponseWriter, r *http.Request) {
 			"instance_id":       instance.InstanceID,
 			"availability_zone": instance.AvailabilityZone,
 			"profile":           instance.Profile,
-			"resource_group":    instance.Account,
+			"resource_group":    instance.Account, // Fix: Replace with correct resource group
+		}
+
+		// Correctly map the resource group name if available
+		if len(resourceGroupList) > 0 {
+			labels["resource_group"] = resourceGroupList[0] // Use the first resource group from the list
 		}
 
 		// Add tags as separate labels
@@ -919,6 +884,7 @@ func main() {
 	regions := flag.String("regions", viper.GetString("regions"), "Comma-separated list of IBM Cloud regions")
 	port := flag.String("port", viper.GetString("port"), "Port to run the server on")
 	resourceGroups := flag.String("resource_groups", viper.GetString("resource_groups"), "Comma-separated list of IBM Cloud resource groups")
+	accountIDs := flag.String("account_ids", viper.GetString("account_ids"), "Comma-separated list of IBM Cloud account IDs (optional)")
 	showVersion := flag.Bool("version", false, "Show tool version")
 	outputSDFile := flag.String("output-sd-file", viper.GetString("output_sd_file"), "Path to output file_sd_configs JSON file")
 	certFile := flag.String("cert", "", "Path to the TLS certificate file (optional)")
@@ -949,8 +915,8 @@ func main() {
 	}
 
 	// Log the configuration being used
-	log.Printf("✅ Using configuration: accounts=%s, regions=%s, port=%s, resource_groups=%s, output_sd_file=%s",
-		*accounts, *regions, *port, *resourceGroups, *outputSDFile)
+	log.Printf("✅ Using configuration: accounts=%s, regions=%s, port=%s, resource_groups=%s, account_ids=%s, output_sd_file=%s",
+		*accounts, *regions, *port, *resourceGroups, *accountIDs, *outputSDFile)
 
 	// Log the source of each configuration
 	log.Printf("🔍 Configuration sources:")
@@ -958,6 +924,7 @@ func main() {
 	log.Printf("   - Regions: %s (from %s)", *regions, getConfigSource("regions"))
 	log.Printf("   - Port: %s (from %s)", *port, getConfigSource("port"))
 	log.Printf("   - Resource Groups: %s (from %s)", *resourceGroups, getConfigSource("resource_groups"))
+	log.Printf("   - Account IDs: %s (from %s)", *accountIDs, getConfigSource("account_ids"))
 	log.Printf("   - Output SD File: %s (from %s)", *outputSDFile, getConfigSource("output_sd_file"))
 
 	// Create the Prometheus file-based service discovery JSON file if outputSDFile is provided

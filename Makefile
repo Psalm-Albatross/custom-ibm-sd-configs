@@ -11,7 +11,7 @@ TARGETS = \
 # Output directory for binaries
 OUTPUT_DIR = bin
 
-VERSION := $(shell git describe --tags --always)
+VERSION := $(shell git describe --tags --abbrev=0)
 
 all: clean build
 
